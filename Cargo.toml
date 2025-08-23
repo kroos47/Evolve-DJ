@@ -1,0 +1,19 @@
+[package]
+name = "discord-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
+poise = "0.6.1"
+serenity = { version = "0.12.4", features = ["client", "gateway", "rustls_backend", "model", "voice"] }
+songbird = { version = "0.5", features = ["builtin-queue", "driver", "gateway"] }
+reqwest = { version = "0.12.23", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dotenv = "0.15"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0.99"
+regex = "1.10"
+symphonia = { version = "0.5", features = ["aac", "isomp4", "mp3"] }
