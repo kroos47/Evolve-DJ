@@ -186,43 +186,43 @@ async fn play(
     let handler_lock = manager.get(guild_id).unwrap();
 
     // Search YouTube if not a URL
-    let processed = if query.starts_with("http") {
-        query.clone()
-    } else {
-        format!("ytsearch1:{query}")
-    };
-    let mut audio_url = match extract_direct_audio_url(&processed).await {
-        Ok(u) => u,
-        // 2) Fallback: loosen selection if the first attempt fails
-        Err(_) => {
-            let out = Command::new("yt-dlp")
-                .args([
-                    "--no-config",
-                    "--no-playlist",
-                    "-g",
-                    "-f",
-                    "ba/b",
-                    &processed,
-                ])
-                .output()
-                .await?;
-            if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                ctx.say(format!("❌ yt-dlp failed: {err}")).await?;
-                return Ok(());
-            }
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string()
-        }
-    };
-    if audio_url.is_empty() {
-        ctx.say("❌ Couldn't extract an audio stream for that query.")
-            .await?;
-        return Ok(());
-    }
+    // let processed = if query.starts_with("http") {
+    //     query.clone()
+    // } else {
+    //     format!("ytsearch1:{query}")
+    // };
+    // let mut audio_url = match extract_direct_audio_url(&processed).await {
+    //     Ok(u) => u,
+    //     // 2) Fallback: loosen selection if the first attempt fails
+    //     Err(_) => {
+    //         let out = Command::new("yt-dlp")
+    //             .args([
+    //                 "--no-config",
+    //                 "--no-playlist",
+    //                 "-g",
+    //                 "-f",
+    //                 "ba/b",
+    //                 &processed,
+    //             ])
+    //             .output()
+    //             .await?;
+    //         if !out.status.success() {
+    //             let err = String::from_utf8_lossy(&out.stderr);
+    //             ctx.say(format!("❌ yt-dlp failed: {err}")).await?;
+    //             return Ok(());
+    //         }
+    //         String::from_utf8_lossy(&out.stdout)
+    //             .lines()
+    //             .next()
+    //             .unwrap_or("")
+    //             .to_string()
+    //     }
+    // };
+    // if audio_url.is_empty() {
+    //     ctx.say("❌ Couldn't extract an audio stream for that query.")
+    //         .await?;
+    //     return Ok(());
+    // }
     let client = reqwest::Client::new();
 
     // let source = YoutubeDl::new(reqwest::Client::new(), processed_query.clone()).user_args(vec![
@@ -236,51 +236,46 @@ async fn play(
     //     "-f".into(),
     //     "ba/b".into(), // the loosest reliable audio selector
     // ]);
-    let content_length = match client.head(&audio_url).send().await {
-        Ok(resp) => resp
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok()),
-        _ => None,
+    let mut meta_ytdl = if query.starts_with("http") {
+        YoutubeDl::new_ytdl_like("yt-dlp", client.clone(), query.clone())
+            .user_args(vec!["--no-config".into(), "--no-playlist".into()])
+    } else {
+        // Use the dedicated *search* constructor for queries.
+        YoutubeDl::new_search_ytdl_like("yt-dlp", client.clone(), query.clone())
+            .user_args(vec!["--no-config".into(), "--no-playlist".into()])
     };
-    // let meta_res = source.clone().aux_metadata().await;
-    let mut req = HttpRequest::new(client.clone(), audio_url.clone());
-    req.content_length = content_length;
-    // Fallback: drop sorting & constraints if the first try fails (e.g., the exact formats aren’t present)
-    // let (source, metadata) = match meta_res {
-    //     Ok(md) => (source, md),
-    //     Err(_) => {
-    //         let loose_args = vec![
-    //             "--no-config".into(),
-    //             "--no-playlist".into(),
-    //             "-f".into(),
-    //             "ba/b".into(), // the loosest reliable audio selector
-    //         ];
-    //         let alt = YoutubeDl::new(client.clone(), processed_query.clone()).user_args(loose_args);
-    //         let md = alt.clone().aux_metadata().await?;
-    //         (alt, md)
-    //     }
-    // };
-    // Get track metadata
-    // let metadata = source.clone().aux_metadata().await?;
-    // let title = metadata.title.as_deref().unwrap_or("Unknown");
-    // let duration = metadata
-    //     .duration
-    //     .map(format_duration)
-    //     .unwrap_or_else(|| "Unknown".to_string());
 
+    let meta = meta_ytdl.aux_metadata().await?;
+    let title = meta.title.as_deref().unwrap_or("Unknown");
+    let duration_str = meta
+        .duration
+        .map(format_duration)
+        .unwrap_or_else(|| "Unknown".to_string());
+    let play_args = vec![
+        "--no-config".into(),
+        "--no-playlist".into(),
+        "-f".into(),
+        "ba/b".into(), // bestaudio or best
+        "--format-sort".into(),
+        "acodec:opus,ext:webm".into(), // prefer Opus/WebM when present
+    ];
+    let play_ytdl = if query.starts_with("http") {
+        YoutubeDl::new_ytdl_like("yt-dlp", client.clone(), query.clone()).user_args(play_args)
+    } else {
+        YoutubeDl::new_search_ytdl_like("yt-dlp", client.clone(), query.clone())
+            .user_args(play_args)
+    };
     // Play the track
     let mut handler = handler_lock.lock().await;
-    handler.play_input(req.into());
+    handler.play_input(play_ytdl.into());
 
-    // ctx.say(format!(
-    //     "🎵 **Now playing:** {} [{}]\n📝 Requested by: {}",
-    //     title,
-    //     duration,
-    //     ctx.author().name
-    // ))
-    // .await?;
+    ctx.say(format!(
+        "🎵 **Now playing:** {} [{}]\n📝 Requested by: {}",
+        title,
+        duration_str,
+        ctx.author().name
+    ))
+    .await?;
 
     Ok(())
 }
@@ -291,7 +286,7 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
     println!("{:?}", token);
-    let intents = GatewayIntents::non_privileged();
+    let intents = GatewayIntents::non_privileged() | GatewayIntents::GUILD_VOICE_STATES;
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![help(), play(), join()],
@@ -308,7 +303,7 @@ async fn main() -> Result<()> {
     let mut client = Client::builder(token, intents)
         .framework(framework)
         .register_songbird()
-        .type_map_insert::<HttpKey>(HttpClient::new())
+        .type_map_insert::<HttpKey>(reqwest::Client::new())
         .await?;
     println!("client initaited");
     tokio::spawn(async move {
