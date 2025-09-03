@@ -185,57 +185,8 @@ async fn play(
 
     let handler_lock = manager.get(guild_id).unwrap();
 
-    // Search YouTube if not a URL
-    // let processed = if query.starts_with("http") {
-    //     query.clone()
-    // } else {
-    //     format!("ytsearch1:{query}")
-    // };
-    // let mut audio_url = match extract_direct_audio_url(&processed).await {
-    //     Ok(u) => u,
-    //     // 2) Fallback: loosen selection if the first attempt fails
-    //     Err(_) => {
-    //         let out = Command::new("yt-dlp")
-    //             .args([
-    //                 "--no-config",
-    //                 "--no-playlist",
-    //                 "-g",
-    //                 "-f",
-    //                 "ba/b",
-    //                 &processed,
-    //             ])
-    //             .output()
-    //             .await?;
-    //         if !out.status.success() {
-    //             let err = String::from_utf8_lossy(&out.stderr);
-    //             ctx.say(format!("❌ yt-dlp failed: {err}")).await?;
-    //             return Ok(());
-    //         }
-    //         String::from_utf8_lossy(&out.stdout)
-    //             .lines()
-    //             .next()
-    //             .unwrap_or("")
-    //             .to_string()
-    //     }
-    // };
-    // if audio_url.is_empty() {
-    //     ctx.say("❌ Couldn't extract an audio stream for that query.")
-    //         .await?;
-    //     return Ok(());
-    // }
     let client = reqwest::Client::new();
 
-    // let source = YoutubeDl::new(reqwest::Client::new(), processed_query.clone()).user_args(vec![
-    //     "--no-playlist".into(), // avoid entire playlists by accident
-    //     "-f".into(),
-    //     format_pref.into(), // <— key fix: safe fallback chain
-    // ]);
-    // let source = YoutubeDl::new(client.clone(), processed_query.clone()).user_args(vec![
-    //     "--no-config".into(),
-    //     "--no-playlist".into(),
-    //     "-f".into(),
-    //     "ba/b".into(), // the loosest reliable audio selector
-    // ]);
     let mut meta_ytdl = if query.starts_with("http") {
         YoutubeDl::new_ytdl_like("yt-dlp", client.clone(), query.clone())
             .user_args(vec!["--no-config".into(), "--no-playlist".into()])
@@ -267,16 +218,24 @@ async fn play(
     };
     // Play the track
     let mut handler = handler_lock.lock().await;
-    handler.play_input(play_ytdl.into());
-
-    ctx.say(format!(
-        "🎵 **Now playing:** {} [{}]\n📝 Requested by: {}",
-        title,
-        duration_str,
-        ctx.author().name
-    ))
-    .await?;
-
+    handler.enqueue_input(play_ytdl.into()).await;
+    if handler.queue().len() > 1 {
+        ctx.say(format!(
+            "🎵 **Track added to queue:** {} [{}]\n📝 Requested by: {}",
+            title,
+            duration_str,
+            ctx.author().name
+        ))
+        .await?;
+    } else {
+        ctx.say(format!(
+            "🎵 **Now playing:** {} [{}]\n📝 Requested by: {}",
+            title,
+            duration_str,
+            ctx.author().name
+        ))
+        .await?;
+    }
     Ok(())
 }
 
