@@ -1,20 +1,18 @@
 use dotenv::dotenv;
 use poise::serenity_prelude::GatewayIntents;
 use reqwest::Client as HttpClient;
-use serenity::{model::user, prelude::TypeMapKey};
+use serenity::prelude::TypeMapKey;
 use songbird::{
     SerenityInit,
-    input::{Compose, HttpRequest, YoutubeDl},
+    input::{Compose, YoutubeDl},
 };
 use tracing::{error, info};
 
 use std::env;
-use tracing::warn;
-struct Handler;
+// struct Handler;
 use anyhow::Result;
 use serenity::client::Client;
 use std::time::Duration;
-use tokio::process::Command;
 pub struct Data {}
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Contx<'a> = poise::Context<'a, Data, Error>;
@@ -36,49 +34,12 @@ async fn help(
     Ok(())
 }
 
-struct YoutubeSearch;
-
-impl YoutubeSearch {
-    pub async fn search_url(query: &str) -> Result<String> {
-        Ok(format!("ytsearch:{}", query))
-    }
-}
-
 struct HttpKey;
 
 impl TypeMapKey for HttpKey {
     type Value = HttpClient;
 }
-async fn extract_direct_audio_url(query: &str) -> anyhow::Result<String> {
-    // Prefer opus/webm when present, otherwise any best audio
-    let args = [
-        "--no-config",
-        "--no-playlist",
-        "-g",
-        "-f",
-        "ba/b",
-        "--format-sort",
-        "acodec:opus,ext:webm",
-        query,
-    ];
 
-    // Run the same thing that works in your shell
-    let out = Command::new("yt-dlp").args(args).output().await?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("yt-dlp failed: {err}");
-    }
-
-    // First line is the direct audio URL
-    let url = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("yt-dlp returned no URL"))?
-        .trim()
-        .to_string();
-
-    Ok(url)
-}
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     let minutes = seconds / 60;
@@ -124,7 +85,7 @@ async fn join(ctx: Contx<'_>) -> Result<(), Error> {
             ctx.say(format!("✅ Joined <#{}>!", connect_to)).await?;
         }
         Err(e) => {
-            // error!("Error joining channel: {:?}", e);
+            error!("Error joining channel: {:?}", e);
             ctx.say("❌ Error joining the channel").await?;
         }
     }
@@ -220,6 +181,12 @@ async fn play(
     let mut handler = handler_lock.lock().await;
     handler.enqueue_input(play_ytdl.into()).await;
     if handler.queue().len() > 1 {
+        info!(
+            "🎵 **Track added to queue:** {} [{}]\n📝 Requested by: {}",
+            title,
+            duration_str,
+            ctx.author().name
+        );
         ctx.say(format!(
             "🎵 **Track added to queue:** {} [{}]\n📝 Requested by: {}",
             title,
@@ -228,6 +195,12 @@ async fn play(
         ))
         .await?;
     } else {
+        info!(
+            "🎵 **Now playing:** {} [{}]\n📝 Requested by: {}",
+            title,
+            duration_str,
+            ctx.author().name
+        );
         ctx.say(format!(
             "🎵 **Now playing:** {} [{}]\n📝 Requested by: {}",
             title,
@@ -239,16 +212,35 @@ async fn play(
     Ok(())
 }
 
+#[poise::command(slash_command, guild_only)]
+async fn stop(ctx: Contx<'_>) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().unwrap();
+
+    let manager = songbird::get(ctx.serenity_context()).await.unwrap();
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let handler = handler_lock.lock().await;
+        let queue = handler.queue();
+        queue.stop();
+        info!("⏹️ Stopped playback and cleared queue");
+        ctx.say("⏹️ Stopped playback and cleared queue").await?;
+    } else {
+        ctx.say("Not in a voice channel!").await?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Configure the client with your Discord bot token in the environment.
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
     println!("{:?}", token);
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::GUILD_VOICE_STATES;
+    let intents = GatewayIntents::non_privileged()
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::MESSAGE_CONTENT;
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![help(), play(), join()],
+            commands: vec![help(), join(), play(), stop()],
             ..Default::default()
         })
         .setup(|ctx, _ready, framework| {
