@@ -1,21 +1,25 @@
 use dotenv::dotenv;
+
 use poise::serenity_prelude::GatewayIntents;
 use reqwest::Client as HttpClient;
+use serenity::client::Client;
+use serenity::model::id::GuildId;
 use serenity::prelude::TypeMapKey;
 use songbird::{
     SerenityInit,
     input::{Compose, YoutubeDl},
 };
+use tokio::sync::RwLock;
 use tracing::{error, info};
 
-use std::env;
-// struct Handler;
 use anyhow::Result;
-use serenity::client::Client;
-use std::time::Duration;
-pub struct Data {}
+
+use std::time::{Duration, Instant};
+use std::{collections::HashMap, env, sync::Arc};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Contx<'a> = poise::Context<'a, Data, Error>;
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60); // 5 minutes
+const ALONE_TIMEOUT: Duration = Duration::from_secs(2 * 60); // 2 minutes when alone
 #[poise::command(prefix_command, slash_command)]
 async fn help(
     ctx: Contx<'_>,
@@ -38,6 +42,116 @@ struct HttpKey;
 
 impl TypeMapKey for HttpKey {
     type Value = HttpClient;
+}
+
+#[derive(Clone)]
+pub struct Data {
+    pub auto_disconnect: Arc<AutoDisconnectManager>,
+}
+
+pub struct AutoDisconnectManager {
+    guild_timer: RwLock<HashMap<GuildId, GuildTimer>>,
+}
+
+pub struct GuildTimer {
+    last_activity: Instant,
+    timer_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AutoDisconnectManager {
+    pub fn new() -> Self {
+        Self {
+            guild_timer: RwLock::new(HashMap::new()),
+        }
+    }
+    async fn start_timer(&self, ctx: Contx<'_>, guild_id: GuildId, duration: Duration) {
+        let mut timers = self.guild_timer.write().await;
+
+        //abort if already existing timer
+        if let Some(timer) = timers.get_mut(&guild_id) {
+            if let Some(task) = timer.timer_task.take() {
+                task.abort();
+            }
+        } else {
+            timers.insert(
+                guild_id,
+                GuildTimer {
+                    last_activity: Instant::now(),
+                    timer_task: None,
+                },
+            );
+        }
+        let guild_timer = timers.get_mut(&guild_id).unwrap();
+
+        guild_timer.last_activity = Instant::now();
+
+        let ctx_ser_clone = ctx.serenity_context().clone();
+
+        // let ctx_clone = ctx.clone();
+        let task =
+            tokio::spawn(async move {
+                tokio::time::sleep(duration).await;
+
+                if let Some(manager) = songbird::get(&ctx_ser_clone).await {
+                    if let Some(handler_lock) = manager.get(guild_id) {
+                        let handler = handler_lock.lock().await;
+                        let queue_check = handler.queue().is_empty();
+
+                        if queue_check {
+                            drop(handler);
+                            let _ = manager.remove(guild_id).await;
+                            // ctx_clone
+                            //     .say(format!(
+                            //         "🔇 Left voice channel due to {} minutes of {}",
+                            //         duration.as_secs() / 60,
+                            //         "time name"
+                            //     ))
+                            //     .await;
+                            if let Ok(channels) =
+                                ctx_ser_clone.http.get_channels(guild_id.into()).await
+                            {
+                                for channel in channels {
+                                    match channel.kind {
+                                        serenity::model::channel::ChannelType::Text => {
+                                            let _ = channel.id.say(&ctx_ser_clone.http,
+                                            format!("🔇 Left voice channel due to {} minutes of {}",
+                                                   duration.as_secs() / 60, "timer_name")).await;
+                                            break;
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        guild_timer.timer_task = Some(task);
+    }
+    pub async fn update_activity(&self, guild_id: GuildId) {
+        let mut timers = self.guild_timer.write().await;
+
+        if let Some(guild_timer) = timers.get_mut(&guild_id) {
+            guild_timer.last_activity = Instant::now();
+
+            // Cancel existing timer
+            if let Some(task) = guild_timer.timer_task.take() {
+                task.abort();
+            }
+        }
+
+        info!("Updated activity for guild {}", guild_id);
+    }
+
+    // Start inactivity timer when queue becomes empty
+    pub async fn start_inactivity_timer(&self, guild_id: GuildId, ctx: Contx<'_>) {
+        self.start_timer(ctx, guild_id, INACTIVITY_TIMEOUT).await;
+    }
+
+    // Start timer when bot is alone in voice channel
+    pub async fn start_alone_timer(&self, guild_id: GuildId, ctx: Contx<'_>) {
+        self.start_timer(ctx, guild_id, ALONE_TIMEOUT).await;
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -180,6 +294,8 @@ async fn play(
     // Play the track
     let mut handler = handler_lock.lock().await;
     handler.enqueue_input(play_ytdl.into()).await;
+    ctx.data().auto_disconnect.update_activity(guild_id).await;
+
     if handler.queue().len() > 1 {
         info!(
             "🎵 **Track added to queue:** {} [{}]\n📝 Requested by: {}",
@@ -222,6 +338,12 @@ async fn stop(ctx: Contx<'_>) -> Result<(), Error> {
         let queue = handler.queue();
         queue.stop();
         info!("⏹️ Stopped playback and cleared queue");
+        drop(handler);
+        ctx.data()
+            .auto_disconnect
+            .start_inactivity_timer(guild_id, ctx)
+            .await;
+
         ctx.say("⏹️ Stopped playback and cleared queue").await?;
     } else {
         ctx.say("Not in a voice channel!").await?;
@@ -235,6 +357,9 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
     println!("{:?}", token);
+    let auto_disconnect = Arc::new(AutoDisconnectManager::new());
+    let auto_disconnect_clone = auto_disconnect.clone();
+
     let intents = GatewayIntents::non_privileged()
         | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::MESSAGE_CONTENT;
@@ -246,11 +371,14 @@ async fn main() -> Result<()> {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                Ok(Data {})
+                Ok(Data {
+                    auto_disconnect: auto_disconnect_clone,
+                })
             })
         })
         .build();
     println!("framework done");
+
     let mut client = Client::builder(token, intents)
         .framework(framework)
         .register_songbird()
