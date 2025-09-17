@@ -162,7 +162,8 @@ impl AutoDisconnectManager {
             info!("Cancelled timers for guild {}", guild_id);
         }
     }
-    pub async fn check_if_alone(&self, ctx: &Context, guild_id: GuildId) {
+
+    pub async fn if_bot_alone(&self, ctx: &Context, guild_id: GuildId) -> bool {
         if let Some(manager) = songbird::get(ctx).await {
             if let Some(handler_lock) = manager.get(guild_id) {
                 let handler = handler_lock.lock().await;
@@ -170,56 +171,106 @@ impl AutoDisconnectManager {
                 if let Some(current_channel) = handler.current_channel() {
                     let channel_id = ChannelId::from(current_channel.0);
 
-                    // Get current bot's user ID
                     let bot_user_id = ctx.cache.current_user().id;
+                    if let Some(guild) = ctx.cache.guild(guild_id) {
+                        let human_count = guild
+                            .voice_states
+                            .values()
+                            .filter(|vs| vs.channel_id == Some(channel_id))
+                            .filter(|vs| vs.user_id != bot_user_id)
+                            .filter_map(|vs| guild.members.get(&vs.user_id))
+                            .filter(|member| !member.user.bot)
+                            .count();
 
-                    // Count non-bot users in the voice channel
-                    let human_count = match ctx.cache.guild(guild_id) {
-                        Some(guild) => {
-                            guild
-                                .voice_states
-                                .values()
-                                .filter(|vs| vs.channel_id == Some(channel_id))
-                                .filter(|vs| vs.user_id != bot_user_id) // Exclude our bot
-                                .filter_map(|vs| guild.members.get(&vs.user_id))
-                                .filter(|member| !member.user.bot) // Exclude all bots
-                                .count()
-                        }
-                        None => {
-                            // If guild not in cache, make HTTP request
-                            info!(
-                                "Guild {} not in cache, cannot determine voice states reliably",
-                                guild_id
-                            );
-                            return;
-                        }
-                    };
-
-                    if human_count == 0 {
                         info!(
-                            "Bot is alone in voice channel (found {} humans), starting alone timer",
-                            human_count
+                            "Found {} humans in voice channel {}",
+                            human_count, channel_id
                         );
-                        drop(handler);
-                        self.start_alone_timer(guild_id, ctx.clone()).await;
+                        return human_count == 0;
                     } else {
-                        info!("Found {} human(s) in voice channel, not alone", human_count);
+                        info!("Guild {} not in cache, assuming not alone", guild_id);
+                        return false; // If guild not in cache, assume not alone
                     }
                 }
             }
         }
+        false
     }
 
+    pub async fn handle_channel_state_change(&self, guild_id: GuildId, ctx: &Context) {
+        info!(
+            "🔄 handle_channel_state_change called for guild {}",
+            guild_id
+        );
+
+        let is_alone = self.if_bot_alone(ctx, guild_id).await;
+
+        if is_alone {
+            info!("   🎯 Bot is alone, switching to 2-minute timer");
+            self.switch_to_alone_timer(guild_id, ctx.clone()).await;
+        } else {
+            info!("   🎯 Bot is not alone, switching to 5-minute timer");
+            self.switch_to_inactivity_timer(guild_id, ctx.clone()).await;
+        }
+
+        info!(
+            "✅ handle_channel_state_change completed for guild {}",
+            guild_id
+        );
+    }
+
+    pub async fn switch_to_alone_timer(&self, guild_id: GuildId, ctx: Context) {
+        info!(
+            "⏰ Switching to 2-minute alone timer for guild {}",
+            guild_id
+        );
+
+        // Cancel any existing timer first
+        self.cancel_timers(guild_id).await;
+
+        // Start new 2-minute timer
+        self.start_alone_timer(guild_id, ctx).await;
+
+        info!("✅ 2-minute timer started for guild {}", guild_id);
+    }
+
+    pub async fn switch_to_inactivity_timer(&self, guild_id: GuildId, ctx: Context) {
+        info!(
+            "⏰ Switching to 5-minute inactivity timer for guild {}",
+            guild_id
+        );
+
+        // Cancel any existing timer first
+        self.cancel_timers(guild_id).await;
+
+        // Start new 5-minute timer
+        self.start_inactivity_timer(guild_id, ctx).await;
+
+        info!("✅ 5-minute timer started for guild {}", guild_id);
+    }
+
+    // Updated handle_voice_join for initial join
     pub async fn handle_voice_join(&self, guild_id: GuildId, ctx: &Context) {
-        // Update activity first (cancels any existing timers)
+        info!("Bot joined voice channel in guild {}", guild_id);
+
+        // Update activity timestamp
         self.update_activity(guild_id).await;
 
-        // Check if alone (starts 2-minute timer if alone)
-        self.check_if_alone(ctx, guild_id).await;
+        // Determine initial timer based on channel state
+        self.handle_channel_state_change(guild_id, ctx).await;
+    }
 
-        // If not alone, start inactivity timer (5 minutes) since no music is playing
-        // Note: check_if_alone will override this with a shorter timer if bot is alone
-        self.start_inactivity_timer(guild_id, ctx.clone()).await;
+    pub async fn handle_music_activity(&self, guild_id: GuildId) {
+        info!(
+            "Music activity detected in guild {}, cancelling auto-disconnect timers",
+            guild_id
+        );
+
+        // Cancel any running timers since music is now playing
+        self.cancel_timers(guild_id).await;
+
+        // Update activity timestamp
+        self.update_activity(guild_id).await;
     }
 }
 
@@ -239,12 +290,64 @@ impl EventHandler for BotEventHandler {
         info!("{} is connected!", ready.user.name);
     }
 
-    async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
-        // Check if someone left and if bot might be alone now
-        if let Some(guild_id) = new.guild_id {
-            // Small delay to let voice states update
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            self.auto_disconnect.check_if_alone(&ctx, guild_id).await;
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        info!("🔄 Voice state update received:");
+        info!("   User: {} ({})", new.user_id, new.user_id);
+        info!("   Guild: {:?}", new.guild_id);
+        info!(
+            "   Old channel: {:?}",
+            old.as_ref().and_then(|o| o.channel_id)
+        );
+        info!("   New channel: {:?}", new.channel_id);
+        let Some(guild_id) = new.guild_id else { return };
+
+        // Check if our bot is in a voice channel in this guild
+        if let Some(manager) = songbird::get(&ctx).await {
+            if let Some(handler_lock) = manager.get(guild_id) {
+                let handler = handler_lock.lock().await;
+
+                if let Some(current_channel) = handler.current_channel() {
+                    let bot_channel_id = ChannelId::from(current_channel.0);
+
+                    // Check if the voice state change affects our bot's channel
+                    let old_affects_bot = old
+                        .as_ref()
+                        .map(|o| o.channel_id == Some(bot_channel_id))
+                        .unwrap_or(false);
+                    let new_affects_bot = new.channel_id == Some(bot_channel_id);
+                    let affects_bot_channel = old_affects_bot || new_affects_bot;
+
+                    if affects_bot_channel {
+                        info!(
+                            "Voice state change affects bot's channel {} in guild {}",
+                            bot_channel_id, guild_id
+                        );
+
+                        // Don't process our own bot's voice state changes
+                        let bot_user_id = ctx.cache.current_user().id;
+                        if (new.user_id) == bot_user_id {
+                            return;
+                        }
+
+                        let queue_empty = handler.queue().is_empty();
+                        drop(handler);
+
+                        if queue_empty {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+
+                            self.auto_disconnect
+                                .handle_channel_state_change(guild_id, &ctx)
+                                .await;
+                        } else {
+                            info!("   🎵 Music is playing, not managing timers");
+                        }
+                    } else {
+                        info!("   ❌ Voice state change doesn't affect bot's channel");
+                    }
+                } else {
+                    info!("   ❌ Bot is not in any voice channel in this guild");
+                }
+            }
         }
     }
 }
@@ -441,7 +544,10 @@ async fn play(
     // Play the track
     let mut handler = handler_lock.lock().await;
     handler.enqueue_input(play_ytdl.into()).await;
-    ctx.data().auto_disconnect.update_activity(guild_id).await;
+    ctx.data()
+        .auto_disconnect
+        .handle_music_activity(guild_id)
+        .await;
 
     if handler.queue().len() > 1 {
         info!(
@@ -504,6 +610,7 @@ async fn main() -> Result<()> {
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
     println!("{:?}", token);
+    tracing_subscriber::fmt().init();
     let auto_disconnect = Arc::new(AutoDisconnectManager::new());
     let auto_disconnect_clone = auto_disconnect.clone();
 
@@ -529,6 +636,7 @@ async fn main() -> Result<()> {
     println!("framework done");
 
     let mut client = Client::builder(token, intents)
+        .event_handler(BotEventHandler::new(auto_disconnect.clone()))
         .framework(framework)
         .register_songbird()
         .type_map_insert::<HttpKey>(reqwest::Client::new())
