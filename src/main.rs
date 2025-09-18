@@ -16,6 +16,7 @@ use songbird::{
     input::{Compose, YoutubeDl},
 };
 use tokio::sync::RwLock;
+// use tokio::time;
 use tracing::{error, info};
 
 use anyhow::Result;
@@ -26,6 +27,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Contx<'a> = poise::Context<'a, Data, Error>;
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const ALONE_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes when alone
+const INACTIVITY: &str = "Inactivity";
+const BOT_ALONE: &str = "Bot is alone";
 #[poise::command(prefix_command, slash_command)]
 async fn help(
     ctx: Contx<'_>,
@@ -70,7 +73,13 @@ impl AutoDisconnectManager {
             guild_timer: RwLock::new(HashMap::new()),
         }
     }
-    async fn start_timer(&self, ctx: Context, guild_id: GuildId, duration: Duration) {
+    async fn start_timer(
+        &self,
+        ctx: Context,
+        guild_id: GuildId,
+        duration: Duration,
+        timer_name: &str,
+    ) {
         let mut timers = self.guild_timer.write().await;
 
         //abort if already existing timer
@@ -92,40 +101,46 @@ impl AutoDisconnectManager {
         guild_timer.last_activity = Instant::now();
 
         let ctx_ser_clone = ctx.clone();
-
+        let timer_name_clone = timer_name.to_owned().clone();
         // let ctx_clone = ctx.clone();
-        let task =
-            tokio::spawn(async move {
-                tokio::time::sleep(duration).await;
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
 
-                if let Some(manager) = songbird::get(&ctx_ser_clone).await {
-                    if let Some(handler_lock) = manager.get(guild_id) {
-                        let handler = handler_lock.lock().await;
-                        let queue_check = handler.queue().is_empty();
+            if let Some(manager) = songbird::get(&ctx_ser_clone).await {
+                if let Some(handler_lock) = manager.get(guild_id) {
+                    let handler = handler_lock.lock().await;
+                    let queue_check = handler.queue().is_empty();
 
-                        if queue_check {
-                            drop(handler);
-                            let _ = manager.remove(guild_id).await;
+                    if queue_check {
+                        drop(handler);
+                        let _ = manager.remove(guild_id).await;
 
-                            if let Ok(channels) =
-                                ctx_ser_clone.http.get_channels(guild_id.into()).await
-                            {
-                                for channel in channels {
-                                    match channel.kind {
-                                        serenity::model::channel::ChannelType::Text => {
-                                            let _ = channel.id.say(&ctx_ser_clone.http,
-                                            format!("🔇 Left voice channel due to {} minutes of {}",
-                                                   duration.as_secs() / 60, "timer_name")).await;
-                                            break;
-                                        }
-                                        _ => continue,
+                        if let Ok(channels) = ctx_ser_clone.http.get_channels(guild_id.into()).await
+                        {
+                            for channel in channels {
+                                match channel.kind {
+                                    serenity::model::channel::ChannelType::Text => {
+                                        let _ = channel
+                                            .id
+                                            .say(
+                                                &ctx_ser_clone.http,
+                                                format!(
+                                                    "👋 Left voice channel due to {} minutes of {}",
+                                                    duration.as_secs() / 60,
+                                                    timer_name_clone
+                                                ),
+                                            )
+                                            .await;
+                                        break;
                                     }
+                                    _ => continue,
                                 }
                             }
                         }
                     }
                 }
-            });
+            }
+        });
         guild_timer.timer_task = Some(task);
     }
     pub async fn update_activity(&self, guild_id: GuildId) {
@@ -144,13 +159,15 @@ impl AutoDisconnectManager {
     }
 
     // Start inactivity timer when queue becomes empty
-    pub async fn start_inactivity_timer(&self, guild_id: GuildId, ctx: Context) {
-        self.start_timer(ctx, guild_id, INACTIVITY_TIMEOUT).await;
+    pub async fn start_inactivity_timer(&self, guild_id: GuildId, ctx: Context, timer_name: &str) {
+        self.start_timer(ctx, guild_id, INACTIVITY_TIMEOUT, timer_name)
+            .await;
     }
 
     // Start timer when bot is alone in voice channel
-    pub async fn start_alone_timer(&self, guild_id: GuildId, ctx: Context) {
-        self.start_timer(ctx, guild_id, ALONE_TIMEOUT).await;
+    pub async fn start_alone_timer(&self, guild_id: GuildId, ctx: Context, timer_name: &str) {
+        self.start_timer(ctx, guild_id, ALONE_TIMEOUT, timer_name)
+            .await;
     }
 
     pub async fn cancel_timers(&self, guild_id: GuildId) {
@@ -229,7 +246,7 @@ impl AutoDisconnectManager {
         self.cancel_timers(guild_id).await;
 
         // Start new 2-minute timer
-        self.start_alone_timer(guild_id, ctx).await;
+        self.start_alone_timer(guild_id, ctx, BOT_ALONE).await;
 
         info!("✅ 2-minute timer started for guild {}", guild_id);
     }
@@ -244,7 +261,7 @@ impl AutoDisconnectManager {
         self.cancel_timers(guild_id).await;
 
         // Start new 5-minute timer
-        self.start_inactivity_timer(guild_id, ctx).await;
+        self.start_inactivity_timer(guild_id, ctx, INACTIVITY).await;
 
         info!("✅ 5-minute timer started for guild {}", guild_id);
     }
@@ -383,7 +400,7 @@ impl SongbirdEventHandler for MusicEventHandler {
                     info!("Queue is empty after track end, starting inactivity timer");
                     drop(handler); // Release lock before async call
                     self.auto_disconnect
-                        .start_inactivity_timer(self.guild_id, self.ctx.clone())
+                        .start_inactivity_timer(self.guild_id, self.ctx.clone(), INACTIVITY)
                         .await;
                 }
             }
@@ -594,7 +611,7 @@ async fn stop(ctx: Contx<'_>) -> Result<(), Error> {
         drop(handler);
         ctx.data()
             .auto_disconnect
-            .start_inactivity_timer(guild_id, ctx.serenity_context().clone())
+            .start_inactivity_timer(guild_id, ctx.serenity_context().clone(), INACTIVITY)
             .await;
 
         ctx.say("⏹️ Stopped playback and cleared queue").await?;
@@ -609,7 +626,6 @@ async fn main() -> Result<()> {
     // Configure the client with your Discord bot token in the environment.
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in environment");
-    println!("{:?}", token);
     tracing_subscriber::fmt().init();
     let auto_disconnect = Arc::new(AutoDisconnectManager::new());
     let auto_disconnect_clone = auto_disconnect.clone();
